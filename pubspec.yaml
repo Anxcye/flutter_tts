@@ -27,6 +27,8 @@ flutter:
       web:
         pluginClass: FlutterTtsPlugin
         fileName: flutter_tts_web.dart
+      ohos:
+        pluginClass: FlutterTtsOhosPlugin
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
