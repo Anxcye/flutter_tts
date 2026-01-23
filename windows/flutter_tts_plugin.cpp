@@ -15,7 +15,14 @@ typedef std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> FlutterR
 
 std::unique_ptr<flutter::MethodChannel<>> methodChannel;
 
-#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP)
+#if 0 // Always use Win32 SAPI implementation to support all voices, including:
+// 1. Traditional desktop voices (e.g., Microsoft Huihui Desktop, Microsoft Zira Desktop)
+// 2. Natural voices from NaturalVoiceSAPIAdapter (e.g., Microsoft Xiaoxiao Online, Microsoft Xiaoyi Online)
+// 3. Other SAPI-compatible voices
+// 
+// This implementation works on all Windows versions, including Windows 7, Windows 10, and Windows 11
+// To get natural voices, users need to install NaturalVoiceSAPIAdapter from:
+// https://github.com/gexgd0419/NaturalVoiceSAPIAdapter
 #include <winrt/Windows.Media.SpeechSynthesis.h>
 #include <winrt/Windows.Media.Playback.h>
 #include <winrt/Windows.Media.Core.h>
@@ -391,149 +398,300 @@ namespace {
 	}
 	void FlutterTtsPlugin::getVoices(flutter::EncodableList& voices) {
 		HRESULT hr;
-		IEnumSpObjectTokens* cpEnum = NULL;
+		CComPtr<IEnumSpObjectTokens> cpEnum;
+		// Get all voices
 		hr = SpEnumTokens(SPCAT_VOICES, NULL, NULL, &cpEnum);
-		if (FAILED(hr)) return;
+		if (FAILED(hr)) {
+			OutputDebugString(L"Failed to enumerate voices\n");
+			return;
+		}
 
  		ULONG ulCount = 0;
-		// Get the number of voices.
 		hr = cpEnum->GetCount(&ulCount);
-		if (FAILED(hr)) return;
-		ISpObjectToken* cpVoiceToken = NULL;
-		while (ulCount--)
+		if (FAILED(hr)) {
+			OutputDebugString(L"Failed to get voice count\n");
+			return;
+		}
+		
+		wchar_t countStr[50];
+		swprintf_s(countStr, sizeof(countStr) / sizeof(wchar_t), L"Found %d voices\n", ulCount);
+		OutputDebugString(countStr);
+		
+		for (ULONG i = 0; i < ulCount; i++)
 		{
-			cpVoiceToken = NULL;
+			CComPtr<ISpObjectToken> cpVoiceToken;
 			hr = cpEnum->Next(1, &cpVoiceToken, NULL);
-			if (FAILED(hr)) return;
+			if (FAILED(hr) || cpVoiceToken == NULL) continue;
+			
+			std::string language = "unknown";
+			std::string name = "unknown";
+			std::string gender = "unknown";
+			std::string identifier = "";
+
+			// Get identifier
+			WCHAR* pszId = NULL;
+			if (SUCCEEDED(cpVoiceToken->GetId(&pszId))) {
+				int idLen = WideCharToMultiByte(CP_UTF8, 0, pszId, -1, NULL, 0, NULL, NULL);
+				if (idLen > 1) {
+					identifier.resize(idLen - 1);
+					WideCharToMultiByte(CP_UTF8, 0, pszId, -1, &identifier[0], idLen, NULL, NULL);
+				}
+				::CoTaskMemFree(pszId);
+			}
+
 			CComPtr<ISpDataKey> cpAttribKey;
 			hr = cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey);
-			if (FAILED(hr)) return;
-			WCHAR* psz = NULL;
-			hr = cpAttribKey->GetStringValue(L"Language", &psz);
-		    wchar_t locale[25];
-            LCIDToLocaleName((LCID)std::strtol(CW2A(psz), NULL, 16), locale, 25, 0);
-            ::CoTaskMemFree(psz);
-            std::string language = CW2A(locale);
-            psz = NULL;
-            cpAttribKey->GetStringValue(L"Name", &psz);
-			std::string name = CW2A(psz);
-			::CoTaskMemFree(psz);
+			if (SUCCEEDED(hr)) {
+				WCHAR* pszValue = NULL;
+				
+				// Get language
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Language", &pszValue))) {
+					wchar_t locale[100] = { 0 };
+					ULONG lcid = wcstoul(pszValue, NULL, 16);
+					if (lcid != 0 && LCIDToLocaleName(lcid, locale, 100, 0) != 0) {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, locale, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, locale, -1, &language[0], localeLen, NULL, NULL);
+						}
+					} else {
+						// Fallback: use the value directly if it's already a locale name
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, &language[0], localeLen, NULL, NULL);
+						}
+					}
+					::CoTaskMemFree(pszValue);
+				}
+				
+				// Get name
+				pszValue = NULL;
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Name", &pszValue))) {
+					int nameLen = WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, NULL, 0, NULL, NULL);
+					if (nameLen > 1) {
+						name.resize(nameLen - 1);
+						WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, &name[0], nameLen, NULL, NULL);
+					}
+					::CoTaskMemFree(pszValue);
+				} else {
+					// Fallback: get description from token
+					WCHAR* pszDesc = NULL;
+					if (SUCCEEDED(SpGetDescription(cpVoiceToken, &pszDesc))) {
+						int descLen = WideCharToMultiByte(CP_UTF8, 0, pszDesc, -1, NULL, 0, NULL, NULL);
+						if (descLen > 1) {
+							name.resize(descLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, pszDesc, -1, &name[0], descLen, NULL, NULL);
+						}
+						::CoTaskMemFree(pszDesc);
+					}
+				}
+
+				// Get gender
+				pszValue = NULL;
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Gender", &pszValue))) {
+					if (wcscmp(pszValue, L"Male") == 0) gender = "male";
+					else if (wcscmp(pszValue, L"Female") == 0) gender = "female";
+					::CoTaskMemFree(pszValue);
+				}
+			} else {
+				// Attributes key missing, try to get at least the name
+				WCHAR* pszDesc = NULL;
+				if (SUCCEEDED(SpGetDescription(cpVoiceToken, &pszDesc))) {
+					int descLen = WideCharToMultiByte(CP_UTF8, 0, pszDesc, -1, NULL, 0, NULL, NULL);
+					if (descLen > 1) {
+						name.resize(descLen - 1);
+						WideCharToMultiByte(CP_UTF8, 0, pszDesc, -1, &name[0], descLen, NULL, NULL);
+					}
+					::CoTaskMemFree(pszDesc);
+				}
+			}
+
             flutter::EncodableMap voiceInfo;
             voiceInfo[flutter::EncodableValue("locale")] = language;
             voiceInfo[flutter::EncodableValue("name")] = name;
+            voiceInfo[flutter::EncodableValue("gender")] = gender;
+            voiceInfo[flutter::EncodableValue("identifier")] = identifier;
             voices.push_back(flutter::EncodableMap(voiceInfo));
-			cpVoiceToken->Release();
 		}
 	}
 	void FlutterTtsPlugin::setVoice(const std::string voiceLanguage, const std::string voiceName, FlutterResult& result) {
 		HRESULT hr;
-		IEnumSpObjectTokens* cpEnum = NULL;
+		CComPtr<IEnumSpObjectTokens> cpEnum;
 		hr = SpEnumTokens(SPCAT_VOICES, NULL, NULL, &cpEnum);
 		if (FAILED(hr)) { result->Success(0); return; }
 		ULONG ulCount = 0;
 		hr = cpEnum->GetCount(&ulCount);
 		if (FAILED(hr)) { result->Success(0); return; }
-		ISpObjectToken* cpVoiceToken = NULL;
+		
 		bool success = false;
-		while (ulCount--)
+		for (ULONG i = 0; i < ulCount; i++)
 		{
-			cpVoiceToken = NULL;
+			CComPtr<ISpObjectToken> cpVoiceToken;
 			hr = cpEnum->Next(1, &cpVoiceToken, NULL);
-			if (FAILED(hr)) { result->Success(0); return; }
+			if (FAILED(hr) || cpVoiceToken == NULL) continue;
+			
+			std::string language = "";
+			std::string name = "";
+
 			CComPtr<ISpDataKey> cpAttribKey;
-			hr = cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey);
-			if (FAILED(hr)) { result->Success(0); return; }
-			WCHAR* psz = NULL;
-			hr = cpAttribKey->GetStringValue(L"Name", &psz);
-			if (FAILED(hr)) { result->Success(0); return; }
-			std::string name = CW2A(psz);
-			::CoTaskMemFree(psz);
-			psz = NULL;
-			hr = cpAttribKey->GetStringValue(L"Language", &psz);
-		    wchar_t locale[25];
-            LCIDToLocaleName((LCID)std::strtol(CW2A(psz), NULL, 16), locale, 25, 0);
-            ::CoTaskMemFree(psz);
-            std::string language = CW2A(locale);
-			if (name == voiceName && language == voiceLanguage)
+			if (SUCCEEDED(cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey))) {
+				WCHAR* pszValue = NULL;
+				
+				// Get name
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Name", &pszValue))) {
+					int nameLen = WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, NULL, 0, NULL, NULL);
+					if (nameLen > 1) {
+						name.resize(nameLen - 1);
+						WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, &name[0], nameLen, NULL, NULL);
+					}
+					::CoTaskMemFree(pszValue);
+				} else {
+					WCHAR* pszDesc = NULL;
+					if (SUCCEEDED(SpGetDescription(cpVoiceToken, &pszDesc))) {
+						int descLen = WideCharToMultiByte(CP_UTF8, 0, pszDesc, -1, NULL, 0, NULL, NULL);
+						if (descLen > 1) {
+							name.resize(descLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, pszDesc, -1, &name[0], descLen, NULL, NULL);
+						}
+						::CoTaskMemFree(pszDesc);
+					}
+				}
+				
+				// Get language
+				pszValue = NULL;
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Language", &pszValue))) {
+					wchar_t locale[100] = { 0 };
+					ULONG lcid = wcstoul(pszValue, NULL, 16);
+					if (lcid != 0 && LCIDToLocaleName(lcid, locale, 100, 0) != 0) {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, locale, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, locale, -1, &language[0], localeLen, NULL, NULL);
+						}
+					} else {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, pszValue, -1, &language[0], localeLen, NULL, NULL);
+						}
+					}
+					::CoTaskMemFree(pszValue);
+				}
+            }
+
+            // Try to match by name and language
+			if ((!name.empty() && name == voiceName && (voiceLanguage.empty() || language == voiceLanguage)) || 
+                (!language.empty() && language == voiceLanguage && voiceName.empty()))
 			{
-				pVoice->SetVoice(cpVoiceToken);
-				success = true;
+				hr = pVoice->SetVoice(cpVoiceToken);
+				if (SUCCEEDED(hr)) {
+					success = true;
+					break;
+				}
 			}
-			cpVoiceToken->Release();
 		}
 		result->Success(success ? 1 : 0);
 	}
 	void FlutterTtsPlugin::getLanguages(flutter::EncodableList& languages)
 	{
 		HRESULT hr;
-		IEnumSpObjectTokens* cpEnum = NULL;
+		CComPtr<IEnumSpObjectTokens> cpEnum;
 		hr = SpEnumTokens(SPCAT_VOICES, NULL, NULL, &cpEnum);
 		if (FAILED(hr)) return;
 
  		ULONG ulCount = 0;
-		// Get the number of voices.
 		hr = cpEnum->GetCount(&ulCount);
 		if (FAILED(hr)) return;
-		ISpObjectToken* cpVoiceToken = NULL;
-        std::set<flutter::EncodableValue> languagesSet = {};
-		while (ulCount--)
-		{
-			cpVoiceToken = NULL;
-			hr = cpEnum->Next(1, &cpVoiceToken, NULL);
-			if (FAILED(hr)) return;
-			CComPtr<ISpDataKey> cpAttribKey;
-			hr = cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey);
-			if (FAILED(hr)) return;
 
-			WCHAR* psz = NULL;
-			hr = cpAttribKey->GetStringValue(L"Language", &psz);
-		    wchar_t locale[25];
-            LCIDToLocaleName((LCID)std::strtol(CW2A(psz), NULL, 16), locale, 25, 0);
-            std::string language = CW2A(locale);
-			languagesSet.insert(flutter::EncodableValue(language));
-			::CoTaskMemFree(psz);
-			cpVoiceToken->Release();
+        std::set<flutter::EncodableValue> languagesSet = {};
+		for (ULONG i = 0; i < ulCount; i++)
+		{
+			CComPtr<ISpObjectToken> cpVoiceToken;
+			hr = cpEnum->Next(1, &cpVoiceToken, NULL);
+			if (FAILED(hr) || cpVoiceToken == NULL) continue;
+
+			CComPtr<ISpDataKey> cpAttribKey;
+			if (SUCCEEDED(cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey))) {
+				WCHAR* pszBuffer = NULL;
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Language", &pszBuffer))) {
+					wchar_t locale[100] = { 0 };
+					ULONG lcid = wcstoul(pszBuffer, NULL, 16);
+					std::string language = "";
+					if (lcid != 0 && LCIDToLocaleName(lcid, locale, 100, 0) != 0) {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, locale, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, locale, -1, &language[0], localeLen, NULL, NULL);
+						}
+					} else {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, pszBuffer, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, pszBuffer, -1, &language[0], localeLen, NULL, NULL);
+						}
+					}
+					if (!language.empty()) {
+						languagesSet.insert(flutter::EncodableValue(language));
+					}
+					::CoTaskMemFree(pszBuffer);
+				}
+			}
 		}
-        std::for_each(begin(languagesSet), end(languagesSet), [&languages](const flutter::EncodableValue value)
-            {
-                languages.push_back(value);
-            });
+        for (const auto& value : languagesSet)
+        {
+            languages.push_back(value);
+        }
 	}
 
 	void FlutterTtsPlugin::setLanguage(const std::string voiceLanguage, FlutterResult& result) {
 		HRESULT hr;
-		IEnumSpObjectTokens* cpEnum = NULL;
+		CComPtr<IEnumSpObjectTokens> cpEnum;
 		hr = SpEnumTokens(SPCAT_VOICES, NULL, NULL, &cpEnum);
 		if (FAILED(hr)) { result->Success(0); return; }
 		ULONG ulCount = 0;
 		hr = cpEnum->GetCount(&ulCount);
 		if (FAILED(hr)) { result->Success(0); return; }
-		ISpObjectToken* cpVoiceToken = NULL;
+		
 		bool found = false;
-		while (ulCount--)
+		for (ULONG i = 0; i < ulCount; i++)
 		{
-			cpVoiceToken = NULL;
+			CComPtr<ISpObjectToken> cpVoiceToken;
 			hr = cpEnum->Next(1, &cpVoiceToken, NULL);
-			if (FAILED(hr)) { result->Success(0); return; }
-			CComPtr<ISpDataKey> cpAttribKey;
-			hr = cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey);
-			if (FAILED(hr)) { result->Success(0); return; }
+			if (FAILED(hr) || cpVoiceToken == NULL) continue;
 
-			WCHAR* psz = NULL;
-			hr = cpAttribKey->GetStringValue(L"Language", &psz);
-		    wchar_t locale[25];
-            LCIDToLocaleName((LCID)std::strtol(CW2A(psz), NULL, 16), locale, 25, 0);
-            std::string language = CW2A(locale);
-			if (language == voiceLanguage)
-			{
-				pVoice->SetVoice(cpVoiceToken);
-				found = true;
+			CComPtr<ISpDataKey> cpAttribKey;
+			if (SUCCEEDED(cpVoiceToken->OpenKey(L"Attributes", &cpAttribKey))) {
+				WCHAR* pszBuffer = NULL;
+				if (SUCCEEDED(cpAttribKey->GetStringValue(L"Language", &pszBuffer))) {
+					wchar_t locale[100] = { 0 };
+					ULONG lcid = wcstoul(pszBuffer, NULL, 16);
+					std::string language = "";
+					if (lcid != 0 && LCIDToLocaleName(lcid, locale, 100, 0) != 0) {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, locale, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, locale, -1, &language[0], localeLen, NULL, NULL);
+						}
+					} else {
+						int localeLen = WideCharToMultiByte(CP_UTF8, 0, pszBuffer, -1, NULL, 0, NULL, NULL);
+						if (localeLen > 1) {
+							language.resize(localeLen - 1);
+							WideCharToMultiByte(CP_UTF8, 0, pszBuffer, -1, &language[0], localeLen, NULL, NULL);
+						}
+					}
+					if (language == voiceLanguage)
+					{
+						pVoice->SetVoice(cpVoiceToken);
+						found = true;
+						::CoTaskMemFree(pszBuffer);
+						break;
+					}
+					::CoTaskMemFree(pszBuffer);
+				}
 			}
-			::CoTaskMemFree(psz);
-			cpVoiceToken->Release();
 		}
-		if (found) result->Success(1);
-		else result->Success(0);
+		result->Success(found ? 1 : 0);
 	}
 
 
